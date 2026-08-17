@@ -76,3 +76,23 @@ func TestProviderCircuitOpensForQuotaErrorsAndRecovers(t *testing.T) {
 		})
 	}
 }
+
+func TestClinePassEnvelopeIsUnwrapped(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"success":true,"data":{"id":"test","object":"chat.completion","created":1,"model":"cline-pass/glm-5.2","choices":[{"index":0,"message":{"role":"assistant","content":"STASH_CLINEPASS_OK"},"finish_reason":"stop"}]}}`))
+	}))
+	defer server.Close()
+
+	reasoner, err := NewOpenAIWithConfig(server.URL, "test-key", "cline-pass/glm-5.2", OpenAIConfig{MaxRetries: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := reasoner.completion(context.Background(), []openai.ChatCompletionMessageParamUnion{openai.UserMessage("canary")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Choices) != 1 || resp.Choices[0].Message.Content != "STASH_CLINEPASS_OK" {
+		t.Fatalf("unexpected unwrapped response: %+v", resp.Choices)
+	}
+}

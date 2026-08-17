@@ -88,6 +88,16 @@ var (
 			Help: "Non-fatal recall learning ledger errors by stage",
 		}, []string{"stage"},
 	)
+	deferredEmbeddings = promauto.NewCounterVec(
+		prometheus.CounterOpts{Name: "stash_deferred_embeddings_total", Help: "Writes preserved without an embedding by memory type"},
+		[]string{"memory_type"},
+	)
+	degradedRecalls = promauto.NewCounter(
+		prometheus.CounterOpts{Name: "stash_degraded_recalls_total", Help: "Recall requests served by PostgreSQL lexical fallback"},
+	)
+	degradedRecallResults = promauto.NewHistogram(
+		prometheus.HistogramOpts{Name: "stash_degraded_recall_results", Help: "Number of lexical results returned during degraded recall", Buckets: []float64{0, 1, 3, 5, 10, 25, 50, 100}},
+	)
 )
 
 // Observation carries the metrics that should be exported for a run.
@@ -135,4 +145,13 @@ func RecordRecallFeedback(signal string) {
 
 func RecordRecallLearningError(stage string) {
 	recallLearningErrors.WithLabelValues(stage).Inc()
+}
+
+func RecordDeferredEmbedding(memoryType string) {
+	deferredEmbeddings.WithLabelValues(memoryType).Inc()
+}
+
+func RecordDegradedRecall(resultCount int) {
+	degradedRecalls.Inc()
+	degradedRecallResults.Observe(float64(resultCount))
 }

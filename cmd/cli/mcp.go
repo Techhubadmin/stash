@@ -810,6 +810,14 @@ func mcpServeCmd(ctx context.Context, cmd *cli.Command) error {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
+	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
+		if err := bc.Brain.Ready(r.Context()); err != nil {
+			http.Error(w, err.Error(), http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ready"))
+	})
 	mux.Handle("/", sseServer)
 	httpServer := &http.Server{Addr: addr, Handler: mux}
 
@@ -872,6 +880,11 @@ func runConsolidationTicker(ctx context.Context, bc *bootstrap.Context, cmd *cli
 	for {
 		select {
 		case <-ticker.C:
+			if updated, err := bc.Brain.BackfillMissingEmbeddings(ctx); err != nil {
+				log.Printf("Embedding backfill deferred: %v", err)
+			} else if updated > 0 {
+				log.Printf("Embedding backfill updated %d memories", updated)
+			}
 			ids, err := bc.Brain.ResolveNamespaceIDs(ctx, namespaces)
 			if err != nil {
 				log.Printf("Consolidation: failed to resolve namespaces: %v", err)

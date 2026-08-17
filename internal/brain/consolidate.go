@@ -97,12 +97,26 @@ func (b *Brain) ConsolidateByID(ctx context.Context, nsID int64) (ConsolidationR
 		return result, fmt.Errorf("get progress: %w", err)
 	}
 
+	// Every reasoner-backed stage below runs against `bc`, a shallow Brain copy
+	// whose reasoner enforces a hard per-cycle call ceiling. Stages call
+	// b.reasoner exactly as before, so no stage can opt out of the ceiling and
+	// no stage had to be taught about it.
+	bc, budget := b.withCycleBudget()
+
 	reasonerBlocked := false
 	reasonerReady := func() bool {
 		if reasonerBlocked {
 			return false
 		}
-		if availability, ok := b.reasoner.(interface{ Availability() error }); ok {
+		// A cycle that has spent its allowance stops here rather than letting
+		// each remaining stage discover exhaustion one paid-looking call at a
+		// time.
+		if budget.Exhausted() {
+			result.Errors = append(result.Errors, ErrCycleBudgetExhausted.Error())
+			reasonerBlocked = true
+			return false
+		}
+		if availability, ok := bc.reasoner.(interface{ Availability() error }); ok {
 			if err := availability.Availability(); err != nil {
 				result.Errors = append(result.Errors, fmt.Sprintf("reasoner circuit open: %v", err))
 				reasonerBlocked = true
@@ -114,7 +128,7 @@ func (b *Brain) ConsolidateByID(ctx context.Context, nsID int64) (ConsolidationR
 
 	// Stage 1: Episodes -> Facts (+ Stage 4: Contradiction detection)
 	if ctx.Err() == nil && reasonerReady() {
-		factsCreated, factsDeduped, episodesRead, llmCalls, contFound, contAuto, errs := b.consolidateEpisodesToFacts(ctx, nsID, cp)
+		factsCreated, factsDeduped, episodesRead, llmCalls, contFound, contAuto, errs := bc.consolidateEpisodesToFacts(ctx, nsID, cp)
 		result.FactsCreated = factsCreated
 		result.FactsDeduplicated = factsDeduped
 		result.EpisodesRead = episodesRead
@@ -126,7 +140,7 @@ func (b *Brain) ConsolidateByID(ctx context.Context, nsID int64) (ConsolidationR
 
 	// Stage 2: Facts -> Relationships
 	if ctx.Err() == nil && reasonerReady() {
-		relCount, llmCalls, errs := b.consolidateFactsToRelationships(ctx, nsID, cp)
+		relCount, llmCalls, errs := bc.consolidateFactsToRelationships(ctx, nsID, cp)
 		result.RelationshipsFound = relCount
 		result.LLMCalls += llmCalls
 		result.Errors = append(result.Errors, errs...)
@@ -134,7 +148,7 @@ func (b *Brain) ConsolidateByID(ctx context.Context, nsID int64) (ConsolidationR
 
 	// Stage 3.5: Facts -> Causal Links
 	if ctx.Err() == nil && reasonerReady() {
-		causalCount, llmCalls, errs := b.consolidateFactsToCausalLinks(ctx, nsID, cp)
+		causalCount, llmCalls, errs := bc.consolidateFactsToCausalLinks(ctx, nsID, cp)
 		result.CausalLinksFound = causalCount
 		result.LLMCalls += llmCalls
 		result.Errors = append(result.Errors, errs...)
@@ -142,7 +156,7 @@ func (b *Brain) ConsolidateByID(ctx context.Context, nsID int64) (ConsolidationR
 
 	// Stage 6: Goal Progress Inference
 	if ctx.Err() == nil && reasonerReady() {
-		annotated, suggestedComplete, llmCalls, errs := b.consolidateGoalProgress(ctx, nsID, cp)
+		annotated, suggestedComplete, llmCalls, errs := bc.consolidateGoalProgress(ctx, nsID, cp)
 		result.GoalsAnnotated = annotated
 		result.GoalsSuggestedComplete = suggestedComplete
 		result.LLMCalls += llmCalls
@@ -151,7 +165,7 @@ func (b *Brain) ConsolidateByID(ctx context.Context, nsID int64) (ConsolidationR
 
 	// Stage 7: Failure Pattern Detection
 	if ctx.Err() == nil && reasonerReady() {
-		repeats, patterns, llmCalls, errs := b.consolidateFailurePatterns(ctx, nsID, cp)
+		repeats, patterns, llmCalls, errs := bc.consolidateFailurePatterns(ctx, nsID, cp)
 		result.FailureRepeatsDetected = repeats
 		result.FailurePatternsFound = patterns
 		result.LLMCalls += llmCalls
@@ -160,7 +174,7 @@ func (b *Brain) ConsolidateByID(ctx context.Context, nsID int64) (ConsolidationR
 
 	// Stage 3: Facts + Relationships -> Patterns
 	if ctx.Err() == nil && reasonerReady() {
-		patCount, llmCalls, errs := b.consolidateToPatterns(ctx, nsID, cp)
+		patCount, llmCalls, errs := bc.consolidateToPatterns(ctx, nsID, cp)
 		result.PatternsFound = patCount
 		result.LLMCalls += llmCalls
 		result.Errors = append(result.Errors, errs...)
@@ -168,7 +182,7 @@ func (b *Brain) ConsolidateByID(ctx context.Context, nsID int64) (ConsolidationR
 
 	// Stage 8: Hypothesis Evidence Scanning
 	if ctx.Err() == nil && reasonerReady() {
-		autoConfirmed, autoRejected, updated, llmCalls, errs := b.consolidateHypothesisEvidence(ctx, nsID, cp)
+		autoConfirmed, autoRejected, updated, llmCalls, errs := bc.consolidateHypothesisEvidence(ctx, nsID, cp)
 		result.HypothesesAutoConfirmed = autoConfirmed
 		result.HypothesesAutoRejected = autoRejected
 		result.HypothesesUpdated = updated
@@ -217,6 +231,8 @@ func (b *Brain) ConsolidateByID(ctx context.Context, nsID int64) (ConsolidationR
 // --- Stage 1: Episodes -> Facts ---
 
 func (b *Brain) consolidateEpisodesToFacts(ctx context.Context, nsID int64, cp *models.ConsolidationProgress) (created, deduped, read, llmCalls, contradictionsFound, contradictionsAutoResolved int, errs []string) {
+	var outcome stageOutcome
+
 	sql, args, err := b.queries.FetchEpisodes(nsID, cp.LastEpisodeID, b.consolidationBatchLimit(0))
 	if err != nil {
 		errs = append(errs, fmt.Sprintf("build fetch episodes: %v", err))
@@ -242,6 +258,7 @@ func (b *Brain) consolidateEpisodesToFacts(ctx context.Context, nsID int64, cp *
 		var embModel *string
 		if err := rows.Scan(&e.ID, &e.NamespaceID, &e.Content, &emb, &embModel, &e.OccurredAt, &e.CreatedAt); err != nil {
 			errs = append(errs, fmt.Sprintf("scan episode: %v", err))
+			outcome.blocking++
 			continue
 		}
 		if emb != nil {
@@ -273,9 +290,13 @@ func (b *Brain) consolidateEpisodesToFacts(ctx context.Context, nsID int64, cp *
 			break
 		}
 
+		var clusterMaxID int64
 		for _, e := range cluster {
 			if e.ID > maxID {
 				maxID = e.ID
+			}
+			if e.ID > clusterMaxID {
+				clusterMaxID = e.ID
 			}
 		}
 
@@ -290,8 +311,13 @@ func (b *Brain) consolidateEpisodesToFacts(ctx context.Context, nsID int64, cp *
 		llmCalls++
 		if err != nil {
 			errs = append(errs, fmt.Sprintf("reason structured: %v", err))
+			// Quarantine is keyed on the cluster's highest episode ID: that is
+			// what the watermark would have to pass to leave this cluster
+			// behind. See TOL-295.
+			outcome.note(ctx, b, nsID, StageEpisodesToFacts, clusterMaxID, err)
 			continue
 		}
+		b.clearRecordQuarantine(ctx, nsID, StageEpisodesToFacts, clusterMaxID)
 
 		if sf.Summary == "" {
 			for _, e := range cluster {
@@ -304,6 +330,9 @@ func (b *Brain) consolidateEpisodesToFacts(ctx context.Context, nsID int64, cp *
 		vec, err := b.embedder.Embed(ctx, sf.Summary)
 		if err != nil {
 			errs = append(errs, fmt.Sprintf("embed fact: %v", err))
+			// Embedder/infrastructure failure, not bad content: keep the
+			// watermark pinned so this cluster is reprocessed.
+			outcome.blocking++
 			continue
 		}
 
@@ -311,6 +340,7 @@ func (b *Brain) consolidateEpisodesToFacts(ctx context.Context, nsID int64, cp *
 		dup, err := b.factExistsByVector(ctx, nsID, vec)
 		if err != nil {
 			errs = append(errs, fmt.Sprintf("check duplicate: %v", err))
+			outcome.blocking++
 			continue
 		}
 		if dup {
@@ -333,6 +363,7 @@ func (b *Brain) consolidateEpisodesToFacts(ctx context.Context, nsID int64, cp *
 		).Scan(&factID)
 		if err != nil {
 			errs = append(errs, fmt.Sprintf("insert fact: %v", err))
+			outcome.blocking++
 			continue
 		}
 		created++
@@ -364,8 +395,9 @@ func (b *Brain) consolidateEpisodesToFacts(ctx context.Context, nsID int64, cp *
 		}
 	}
 
-	// Only advance checkpoint if no errors occurred (bullet-proof: prevents losing episodes)
-	if len(errs) == 0 && maxID > cp.LastEpisodeID {
+	// Advance unless something still genuinely needs retrying. Quarantined
+	// clusters do not block: they have already had their attempts.
+	if outcome.canAdvance() && maxID > cp.LastEpisodeID {
 		cp.LastEpisodeID = maxID
 	}
 	return
@@ -470,6 +502,8 @@ func strPtrOrNull(s string) *string {
 // --- Stage 2: Facts -> Relationships ---
 
 func (b *Brain) consolidateFactsToRelationships(ctx context.Context, nsID int64, cp *models.ConsolidationProgress) (count, llmCalls int, errs []string) {
+	var outcome stageOutcome
+
 	sql, args, err := b.queries.FetchFacts(nsID, cp.LastFactID, b.consolidationBatchLimit(50))
 	if err != nil {
 		errs = append(errs, fmt.Sprintf("build fetch facts: %v", err))
@@ -488,6 +522,7 @@ func (b *Brain) consolidateFactsToRelationships(ctx context.Context, nsID int64,
 		var f models.Fact
 		if err := rows.Scan(&f.ID, &f.NamespaceID, &f.Content, &f.Embedding, &f.EmbeddingModel, &f.Confidence, &f.Entity, &f.Property, &f.Value, &f.ValidFrom, &f.ValidUntil, &f.CreatedAt, &f.UpdatedAt); err != nil {
 			errs = append(errs, fmt.Sprintf("scan fact: %v", err))
+			outcome.blocking++
 			continue
 		}
 		facts = append(facts, f)
@@ -514,8 +549,15 @@ func (b *Brain) consolidateFactsToRelationships(ctx context.Context, nsID int64,
 		llmCalls++
 		if err != nil {
 			errs = append(errs, fmt.Sprintf("reason relationships fact %d: %v", fact.ID, err))
+			// A transient failure keeps the watermark pinned so we retry. A
+			// permanent one (unparseable output, entity not in content) counts
+			// an attempt and, past the ceiling, lets the watermark move on.
+			// Without this a single bad fact is re-sent to the paid reasoner
+			// every cycle forever — see TOL-295.
+			outcome.note(ctx, b, nsID, StageFactsToRelations, fact.ID, err)
 			continue
 		}
+		b.clearRecordQuarantine(ctx, nsID, StageFactsToRelations, fact.ID)
 
 		for _, rel := range rels {
 			if rel.FromEntity == "" || rel.RelationType == "" || rel.ToEntity == "" {
@@ -535,14 +577,18 @@ func (b *Brain) consolidateFactsToRelationships(ctx context.Context, nsID int64,
 			)
 			if err != nil {
 				errs = append(errs, fmt.Sprintf("insert relationship: %v", err))
+				// A write failure is infrastructure, not bad content: keep the
+				// watermark pinned so the fact is reprocessed.
+				outcome.blocking++
 				continue
 			}
 			count++
 		}
 	}
 
-	// Only advance checkpoint if no errors occurred (bullet-proof: prevents losing facts)
-	if len(errs) == 0 && maxID > cp.LastFactID {
+	// Advance unless something still genuinely needs retrying. Quarantined
+	// records do not block: they have already had their attempts.
+	if outcome.canAdvance() && maxID > cp.LastFactID {
 		cp.LastFactID = maxID
 	}
 	return

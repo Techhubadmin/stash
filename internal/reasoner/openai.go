@@ -1,10 +1,13 @@
 package reasoner
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -102,6 +105,7 @@ func NewOpenAIWithConfig(baseURL, apiKey, model string, cfg OpenAIConfig) (*Open
 		option.WithBaseURL(baseURL),
 		option.WithAPIKey(apiKey),
 		option.WithMaxRetries(cfg.MaxRetries),
+		option.WithMiddleware(unwrapOpenAIEnvelope),
 	)
 
 	return &OpenAI{
@@ -113,6 +117,33 @@ func NewOpenAIWithConfig(baseURL, apiKey, model string, cfg OpenAIConfig) (*Open
 		serverErrorCooldown: cfg.ServerErrorCooldown,
 		now:                 time.Now,
 	}, nil
+}
+
+// unwrapOpenAIEnvelope accepts providers such as ClinePass that return the
+// otherwise standard OpenAI response under {"success":true,"data":...}.
+// Ordinary OpenAI-compatible responses pass through byte-for-byte.
+func unwrapOpenAIEnvelope(req *http.Request, next option.MiddlewareNext) (*http.Response, error) {
+	resp, err := next(req)
+	if err != nil || resp == nil || resp.Body == nil {
+		return resp, err
+	}
+	body, readErr := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if readErr != nil {
+		return nil, readErr
+	}
+	decoded := body
+	var envelope struct {
+		Success bool            `json:"success"`
+		Data    json.RawMessage `json:"data"`
+	}
+	if json.Unmarshal(body, &envelope) == nil && envelope.Success && len(envelope.Data) > 0 {
+		decoded = envelope.Data
+	}
+	resp.Body = io.NopCloser(bytes.NewReader(decoded))
+	resp.ContentLength = int64(len(decoded))
+	resp.Header.Set("Content-Length", fmt.Sprintf("%d", len(decoded)))
+	return resp, nil
 }
 
 // Availability returns an error without making a provider request when the
