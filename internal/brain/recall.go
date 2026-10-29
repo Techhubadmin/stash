@@ -102,7 +102,7 @@ func (b *Brain) RecallWithOptions(ctx context.Context, namespaces []string, quer
 	}
 
 	// In learning mode both types are over-fetched before the unified rerank.
-	// With the feature disabled, preserve the legacy facts-first behavior.
+	// Otherwise each type fetches up to limit and they are merged by score below.
 	factLimit := candidateLimit
 	factSQL, factArgs, err := b.queries.RecallFacts(nsIDs, pgVec, factLimit)
 	if err != nil {
@@ -147,8 +147,11 @@ func (b *Brain) RecallWithOptions(ctx context.Context, namespaces []string, quer
 		return nil, fmt.Errorf("fact rows: %w", err)
 	}
 
-	// Search episodes for remaining slots
-	episodeLimit := limit - len(results)
+	// Episodes compete for slots on score; the merged list is sorted and truncated below.
+	// "Remaining slots only" starved episodes whenever facts filled the limit, so anything
+	// not yet consolidated into a fact (e.g. while the consolidation reasoner is down) was
+	// never recalled, with no signal that results were stale.
+	episodeLimit := limit
 	if learningEnabled || providerRerankEnabled {
 		episodeLimit = candidateLimit
 	}
