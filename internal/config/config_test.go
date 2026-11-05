@@ -1,9 +1,12 @@
 package config
 
 import (
+	"math"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 // This Config is parsed with env.Options{RequiredIfNoDef: true}, which means a
@@ -39,6 +42,127 @@ func TestShadowConfigFieldsAreOptional(t *testing.T) {
 		if strings.Contains(tag, ",required") {
 			t.Errorf("%s is marked required but shadow embedding is opt-in. Tag: %s", name, tag)
 		}
+	}
+}
+
+// Set every field explicitly so tests do not inherit the host configuration.
+func validConfigFromEnvironment(t *testing.T) *Config {
+	t.Helper()
+	typ := reflect.TypeOf(Config{})
+	for i := 0; i < typ.NumField(); i++ {
+		field := typ.Field(i)
+		name := strings.Split(field.Tag.Get("env"), ",")[0]
+		value, ok := field.Tag.Lookup("envDefault")
+		if !ok {
+			switch field.Name {
+			case "VectorDim":
+				value = "1024"
+			case "MaxResultSize":
+				value = "10"
+			case "ContextTTL":
+				value = "1h"
+			default:
+				value = "test"
+			}
+		}
+		t.Setenv(name, value)
+	}
+	cfg, err := NewFromFile(filepath.Join(t.TempDir(), "missing.env"))
+	if err != nil {
+		t.Fatalf("valid environment: %v", err)
+	}
+	return cfg
+}
+
+func TestValidateValidConfig(t *testing.T) {
+	cfg := validConfigFromEnvironment(t)
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestValidateInvalidValues(t *testing.T) {
+	base := validConfigFromEnvironment(t)
+	cases := []struct {
+		field string
+		value any
+		rule  string
+	}{
+		{"ConsolidationWindow", "soon", "must parse as a duration and be > 0"},
+		{"ConsolidationWindow", "0s", "must parse as a duration and be > 0"},
+		{"ConsolidationWindow", "-1s", "must parse as a duration and be > 0"},
+		{"VectorDim", 0, "must be >= 1"},
+		{"VectorDim", 2001, "must be <= 2000"},
+		{"ShadowVectorDim", 2001, "must be <= 2000"},
+		{"MaxResultSize", 0, "must be >= 1"},
+		{"ConsolidationBatchSize", 0, "must be >= 1"},
+		{"RetrievalOverfetchFactor", 0, "must be >= 1"},
+		{"EmbeddingBackfillBatch", 0, "must be >= 1"},
+		{"MaxRecordAttempts", 0, "must be >= 1"},
+		{"CycleReasonerCallCeiling", 0, "must be >= 1"},
+		{"ShadowMigrateBatch", 0, "must be >= 1"},
+		{"ProviderRerankCandidateLimit", 0, "must be >= 1"},
+		{"ReasonerMaxTokens", int64(0), "must be >= 1"},
+		{"EmbedderMaxRetries", -1, "must be >= 0"},
+		{"ReasonerMaxRetries", -1, "must be >= 0"},
+	}
+	for _, field := range []string{
+		"ConsolidationSimilarityThreshold", "ConsolidationDedupThreshold", "DecayFactor",
+		"ExpiryThreshold", "HypothesisAutoConfirmThreshold", "HypothesisAutoRejectThreshold",
+		"RetrievalUtilityWeight", "RetrievalMaxUtilityDelta",
+	} {
+		for _, value := range []float64{-0.1, 1.1, math.NaN(), math.Inf(1)} {
+			cases = append(cases, struct {
+				field string
+				value any
+				rule  string
+			}{field, value, "must be within [0, 1]"})
+		}
+	}
+	for _, field := range []string{
+		"EmbedderRateLimitCooldown", "EmbedderPaymentCooldown", "EmbedderServerErrorCooldown",
+		"ReasonerRateLimitCooldown", "ReasonerPaymentCooldown", "ReasonerServerErrorCooldown",
+		"ContextTTL", "RecallHistoryRetention",
+	} {
+		cases = append(cases, struct {
+			field string
+			value any
+			rule  string
+		}{field, -time.Second, "must be >= 0"})
+	}
+	for _, tc := range cases {
+		t.Run(tc.field, func(t *testing.T) {
+			cfg := *base
+			field := reflect.ValueOf(&cfg).Elem().FieldByName(tc.field)
+			field.Set(reflect.ValueOf(tc.value).Convert(field.Type()))
+			tag, _ := reflect.TypeOf(cfg).FieldByName(tc.field)
+			name := strings.Split(tag.Tag.Get("env"), ",")[0]
+			err := cfg.Validate()
+			if err == nil || !strings.Contains(err.Error(), name+"=") || !strings.Contains(err.Error(), tc.rule) {
+				t.Fatalf("Validate() = %v, want %s and %q", err, name, tc.rule)
+			}
+			if strings.Count(err.Error(), "\n") != 0 {
+				t.Fatalf("expected exactly one violation, got %v", err)
+			}
+		})
+	}
+}
+
+func TestNewFromFileReturnsAllValidationErrors(t *testing.T) {
+	validConfigFromEnvironment(t)
+	t.Setenv("STASH_CONSOLIDATION_WINDOW", "soon")
+	t.Setenv("STASH_DECAY_FACTOR", "2")
+	cfg, err := NewFromFile(filepath.Join(t.TempDir(), "missing.env"))
+	if cfg != nil || err == nil {
+		t.Fatalf("NewFromFile() = %v, %v; want nil config and validation error", cfg, err)
+	}
+	for _, want := range []string{"STASH_CONSOLIDATION_WINDOW=soon", "STASH_DECAY_FACTOR=2"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q missing %q", err, want)
+		}
+	}
+	if strings.Count(err.Error(), "\n") != 1 {
+		t.Fatalf("expected two violation lines, got %v", err)
 	}
 }
 

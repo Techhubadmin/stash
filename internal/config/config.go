@@ -1,6 +1,8 @@
 package config
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"time"
 
@@ -132,6 +134,70 @@ func (c *Config) ProviderRerankEnabled() bool {
 	return c.ProviderRerankModel != "" && c.ProviderRerankAPIKey != ""
 }
 
+// Validate reports all invalid configuration values, one violation per line.
+func (c *Config) Validate() error {
+	var violations []error
+	check := func(valid bool, name string, value any, rule string) {
+		if !valid {
+			violations = append(violations, fmt.Errorf("%s=%v: %s", name, value, rule))
+		}
+	}
+	window, err := time.ParseDuration(c.ConsolidationWindow)
+	check(err == nil && window > 0, "STASH_CONSOLIDATION_WINDOW", c.ConsolidationWindow, "must parse as a duration and be > 0")
+	for _, item := range []struct {
+		name  string
+		value float64
+	}{
+		{"STASH_CONSOLIDATION_SIMILARITY_THRESHOLD", c.ConsolidationSimilarityThreshold},
+		{"STASH_CONSOLIDATION_DEDUP_THRESHOLD", c.ConsolidationDedupThreshold},
+		{"STASH_DECAY_FACTOR", c.DecayFactor},
+		{"STASH_EXPIRY_THRESHOLD", float64(c.ExpiryThreshold)},
+		{"STASH_HYPOTHESIS_AUTO_CONFIRM_THRESHOLD", float64(c.HypothesisAutoConfirmThreshold)},
+		{"STASH_HYPOTHESIS_AUTO_REJECT_THRESHOLD", float64(c.HypothesisAutoRejectThreshold)},
+		{"STASH_RETRIEVAL_UTILITY_WEIGHT", c.RetrievalUtilityWeight},
+		{"STASH_RETRIEVAL_MAX_UTILITY_DELTA", c.RetrievalMaxUtilityDelta},
+	} {
+		check(item.value >= 0 && item.value <= 1, item.name, item.value, "must be within [0, 1]")
+	}
+	for _, item := range []struct {
+		name  string
+		value int
+	}{
+		{"STASH_VECTOR_DIM", c.VectorDim},
+		{"STASH_MAX_RESULT_SIZE", c.MaxResultSize},
+		{"STASH_CONSOLIDATION_BATCH_SIZE", c.ConsolidationBatchSize},
+		{"STASH_RETRIEVAL_OVERFETCH_FACTOR", c.RetrievalOverfetchFactor},
+		{"STASH_EMBEDDING_BACKFILL_BATCH", c.EmbeddingBackfillBatch},
+		{"STASH_MAX_RECORD_ATTEMPTS", c.MaxRecordAttempts},
+		{"STASH_CYCLE_REASONER_CALL_CEILING", c.CycleReasonerCallCeiling},
+		{"STASH_SHADOW_MIGRATE_BATCH", c.ShadowMigrateBatch},
+		{"STASH_DEEPINFRA_RERANK_CANDIDATE_LIMIT", c.ProviderRerankCandidateLimit},
+	} {
+		check(item.value >= 1, item.name, item.value, "must be >= 1")
+	}
+	check(c.VectorDim <= 2000, "STASH_VECTOR_DIM", c.VectorDim, "must be <= 2000")
+	check(c.ShadowVectorDim <= 2000, "STASH_SHADOW_VECTOR_DIM", c.ShadowVectorDim, "must be <= 2000")
+	check(c.ReasonerMaxTokens >= 1, "STASH_REASONER_MAX_TOKENS", c.ReasonerMaxTokens, "must be >= 1")
+	check(c.EmbedderMaxRetries >= 0, "STASH_EMBEDDER_MAX_RETRIES", c.EmbedderMaxRetries, "must be >= 0")
+	check(c.ReasonerMaxRetries >= 0, "STASH_REASONER_MAX_RETRIES", c.ReasonerMaxRetries, "must be >= 0")
+	for _, item := range []struct {
+		name  string
+		value time.Duration
+	}{
+		{"STASH_EMBEDDER_RATE_LIMIT_COOLDOWN", c.EmbedderRateLimitCooldown},
+		{"STASH_EMBEDDER_PAYMENT_COOLDOWN", c.EmbedderPaymentCooldown},
+		{"STASH_EMBEDDER_SERVER_ERROR_COOLDOWN", c.EmbedderServerErrorCooldown},
+		{"STASH_REASONER_RATE_LIMIT_COOLDOWN", c.ReasonerRateLimitCooldown},
+		{"STASH_REASONER_PAYMENT_COOLDOWN", c.ReasonerPaymentCooldown},
+		{"STASH_REASONER_SERVER_ERROR_COOLDOWN", c.ReasonerServerErrorCooldown},
+		{"STASH_CONTEXT_TTL", c.ContextTTL},
+		{"STASH_RECALL_HISTORY_RETENTION", c.RecallHistoryRetention},
+	} {
+		check(item.value >= 0, item.name, item.value, "must be >= 0")
+	}
+	return errors.Join(violations...)
+}
+
 func NewFromFile(filename string) (*Config, error) {
 	if _, err := os.Stat(filename); err == nil {
 		if err := godotenv.Load(filename); err != nil {
@@ -146,6 +212,9 @@ func NewFromFile(filename string) (*Config, error) {
 		RequiredIfNoDef: true,
 	}
 	if err := env.ParseWithOptions(cfg, opts); err != nil {
+		return nil, err
+	}
+	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
 	return cfg, nil
