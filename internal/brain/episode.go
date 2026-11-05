@@ -15,7 +15,8 @@ import (
 // If occurredAt is nil, the current time is used.
 // Returns the episode ID on success.
 func (b *Brain) Remember(ctx context.Context, namespaceSlug, content string, occurredAt *time.Time) (int64, error) {
-	if err := validateContent(content); err != nil {
+	content, err := normalizeContent(content)
+	if err != nil {
 		return 0, err
 	}
 	if err := validatePath(namespaceSlug); err != nil {

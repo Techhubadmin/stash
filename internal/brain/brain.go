@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/alash3al/stash/internal/embedder"
 	"github.com/alash3al/stash/internal/queries"
@@ -18,6 +19,8 @@ var (
 	ErrEpisodeNotFound   = fmt.Errorf("brain: episode not found")
 	ErrFactNotFound      = fmt.Errorf("brain: fact not found")
 	ErrEmptyContent      = fmt.Errorf("brain: content cannot be empty")
+	ErrBlankContent      = fmt.Errorf("brain: content cannot be only whitespace")
+	ErrInvalidContent    = fmt.Errorf("brain: content must be valid UTF-8 without NUL bytes")
 	ErrContentTooLong    = fmt.Errorf("brain: content exceeds maximum length")
 	ErrInvalidPath       = fmt.Errorf("brain: namespace path must start with / and contain valid segments (lowercase alphanumeric, hyphens, underscores)")
 
@@ -180,10 +183,25 @@ func validateContent(content string) error {
 	if content == "" {
 		return ErrEmptyContent
 	}
+	if !utf8.ValidString(content) || strings.Contains(content, "\x00") {
+		return ErrInvalidContent
+	}
+	if strings.TrimSpace(content) == "" {
+		return ErrBlankContent
+	}
 	if len(content) > maxContentLen {
 		return ErrContentTooLong
 	}
 	return nil
+}
+
+// normalizeContent validates content and returns it with leading and trailing
+// whitespace removed, ready to be embedded and stored.
+func normalizeContent(content string) (string, error) {
+	if err := validateContent(content); err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(content), nil
 }
 
 func validatePath(path string) error {
