@@ -29,11 +29,18 @@ jobs:
       STASH_TEST_POSTGRES_DSN: postgresql://stash:stash_test_password@localhost:5432/stash_test?sslmode=disable
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-go@v5
         with:
           go-version: '1.25.x'
-          cache: true
-      - run: gofmt -d .
+          # No cache: this workflow also runs on agent-written PR branches, and a
+          # cache an agent branch could seed must never feed a main build.
+          cache: false
+      - name: gofmt (fails on any unformatted file)
+        run: |
+          out="$(gofmt -l .)"
+          if [ -n "$out" ]; then echo "unformatted:"; echo "$out"; gofmt -d .; exit 1; fi
       - run: go vet ./...
       - run: go test -race ./... -count=1
       - run: go build ./cmd/cli/

@@ -1,0 +1,62 @@
+name: Switchboard tests (agent branches, no secrets)
+
+# Tests branches written by AI agents through the Switchboard dispatcher
+# (switchboard/**). Switchboard waits for this workflow's result on the exact
+# commit before a human sees a PR, and again before a release merges.
+#
+# This job holds NO secrets and a read-only token, uses no Go module/build cache
+# (so an agent branch cannot seed one), and does not deploy. The Postgres it
+# tests against is a throwaway service container with a throwaway password;
+# nothing here can reach production memory.
+#
+# The job is named distinctly from test.yml's `go-test` so a ruleset can require
+# the PR check by name without ambiguity.
+
+on:
+  push:
+    branches: ["switchboard/**"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: switchboard-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  switchboard-go-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_DB: stash_test
+          POSTGRES_USER: stash
+          POSTGRES_PASSWORD: stash_test_password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U stash -d stash_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      STASH_TEST_POSTGRES_DSN: postgresql://stash:stash_test_password@localhost:5432/stash_test?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+          cache: false
+      - name: gofmt (fails on any unformatted file)
+        run: |
+          out="$(gofmt -l .)"
+          if [ -n "$out" ]; then echo "unformatted:"; echo "$out"; gofmt -d .; exit 1; fi
+      - run: go vet ./...
+      - name: Database-backed tests must run, not skip
+        run: pg_isready -h localhost -p 5432 -U stash -d stash_test
+      - run: go test -race ./... -count=1
+      - run: go build ./cmd/cli/
