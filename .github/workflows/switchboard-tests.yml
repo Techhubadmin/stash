@@ -4,6 +4,11 @@ name: Switchboard tests (agent branches, no secrets)
 # (switchboard/**). Switchboard waits for this workflow's result on the exact
 # commit before a human sees a PR, and again before a release merges.
 #
+# The same job also runs on pull requests into main and on pushes to main
+# (EXEC-122). A human pull request and the base branch then get a result,
+# which Switchboard's onboarding preflight requires. The push of
+# switchboard/** stays, because that is the run Switchboard waits for.
+#
 # This job holds NO secrets and a read-only token, uses no Go module/build cache
 # (so an agent branch cannot seed one), and does not deploy. The Postgres it
 # tests against is a throwaway service container with a throwaway password;
@@ -13,8 +18,10 @@ name: Switchboard tests (agent branches, no secrets)
 # the PR check by name without ambiguity.
 
 on:
+  pull_request:
+    branches: ["main"]
   push:
-    branches: ["switchboard/**"]
+    branches: ["main", "switchboard/**"]
 
 permissions:
   contents: read
